@@ -10,43 +10,6 @@ import json
 import os
 from datetime import datetime
 import argparse
-from pathlib import Path
-from hashlib import md5
-import pickle
-
-class CacheError(Exception):
-    """Raised when a cache operation fails."""
-    pass
-
-CACHE_DIR_PATH = os.environ.get("CACHE_DIR", "cache")
-CACHE_DIR = Path(CACHE_DIR_PATH)
-
-CACHE_DIR.mkdir(exist_ok=True)
-
-def cache_file(key: str) -> str:
-    encoded = md5(key.encode()).hexdigest()
-    return f"{encoded}.pkl"
-
-def cache_get(name: str) -> dict | None:
-    path = CACHE_DIR / cache_file(name)
-    if path.exists():
-        with path.open("rb") as f:
-            return pickle.load(f)
-    return None
-
-def cache_set(name: str, obj) -> None:
-    path = CACHE_DIR / cache_file(name)
-    try:
-        with path.open("wb") as f:
-            pickle.dump(obj, f)
-    except pickle.PickleError as e:
-        raise CacheError(
-            f"Serialization error while saving cache for '{name}': {e}"
-        ) from e
-    except (OSError, IOError) as e:
-        raise CacheError(
-            f"File error while saving cache for '{name}': {e}"
-        ) from e
 
 THEMES_DIR = "themes"
 FONTS_DIR = "fonts"
@@ -73,7 +36,7 @@ def load_fonts():
 
 FONTS = load_fonts()
 
-def generate_output_filename(city, theme_name, output_format):
+def generate_output_filename(city, theme_name, distance, dpi):
     """
     Generate unique output filename with city, theme, and datetime.
     """
@@ -82,8 +45,10 @@ def generate_output_filename(city, theme_name, output_format):
     
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     city_slug = city.lower().replace(' ', '_')
-    ext = output_format.lower()
-    filename = f"{city_slug}_{theme_name}_{timestamp}.{ext}"
+    map_radius = distance
+    resolution = dpi
+    #filename = f"{city_slug}_{theme_name}_{timestamp}.png"
+    filename = f"{city_slug}_{theme_name}_{map_radius}m_{resolution}dpi_{timestamp}.png"
     return os.path.join(POSTERS_DIR, filename)
 
 def get_available_themes():
@@ -236,14 +201,8 @@ def get_coordinates(city, country):
     Fetches coordinates for a given city and country using geopy.
     Includes rate limiting to be respectful to the geocoding service.
     """
-    coords = f"coords_{city.lower()}_{country.lower()}"
-    cached = cache_get(coords)
-    if cached:
-        print(f"✓ Using cached coordinates for {city}, {country}")
-        return cached
-
     print("Looking up coordinates...")
-    geolocator = Nominatim(user_agent="city_map_poster", timeout=10)
+    geolocator = Nominatim(user_agent="city_map_poster")
     
     # Add a small delay to respect Nominatim's usage policy
     time.sleep(1)
@@ -253,78 +212,39 @@ def get_coordinates(city, country):
     if location:
         print(f"✓ Found: {location.address}")
         print(f"✓ Coordinates: {location.latitude}, {location.longitude}")
-        try:
-            cache_set(coords, (location.latitude, location.longitude))
-        except CacheError as e:
-            print(e)
         return (location.latitude, location.longitude)
     else:
         raise ValueError(f"Could not find coordinates for {city}, {country}")
 
-def fetch_graph(point, dist):
-    lat, lon = point
-    graph = f"graph_{lat}_{lon}_{dist}"
-    cached = cache_get(graph)
-    if cached is not None:
-        print("✓ Using cached street network")
-        return cached
-
-    try:
-        G = ox.graph_from_point(point, dist=dist, dist_type='bbox', network_type='all')
-        # Rate limit between requests
-        time.sleep(0.5)
-        try:
-            cache_set(graph, G)
-        except CacheError as e:
-            print(e)
-        return G
-    except Exception as e:
-        print(f"OSMnx error while fetching graph: {e}")
-        return None
-
-def fetch_features(point, dist, tags, name):
-    lat, lon = point
-    tag_str = "_".join(tags.keys())
-    features = f"{name}_{lat}_{lon}_{dist}_{tag_str}"
-    cached = cache_get(features)
-    if cached is not None:
-        print(f"✓ Using cached {name}")
-        return cached
-
-    try:
-        data = ox.features_from_point(point, tags=tags, dist=dist)
-        # Rate limit between requests
-        time.sleep(0.3)
-        try:
-            cache_set(features, data)
-        except CacheError as e:
-            print(e)
-        return data
-    except Exception as e:
-        print(f"OSMnx error while fetching features: {e}")
-        return None
-
-def create_poster(city, country, point, dist, output_file, output_format):
+def create_poster(city, country, point, dist, output_file):
     print(f"\nGenerating map for {city}, {country}...")
     
     # Progress bar for data fetching
     with tqdm(total=3, desc="Fetching map data", unit="step", bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt}') as pbar:
         # 1. Fetch Street Network
         pbar.set_description("Downloading street network")
-        G = fetch_graph(point, dist)
+        G = ox.graph_from_point(point, dist=dist, dist_type='bbox', network_type='all')
         pbar.update(1)
+        time.sleep(0.5)  # Rate limit between requests
         
         # 2. Fetch Water Features
         pbar.set_description("Downloading water features")
-        water = fetch_features(point, dist, {'natural': 'water', 'waterway': 'riverbank'}, 'water')
+        try:
+            water = ox.features_from_point(point, tags={'natural': 'water', 'waterway': 'riverbank'}, dist=dist)
+        except:
+            water = None
         pbar.update(1)
+        time.sleep(0.3)
         
         # 3. Fetch Parks
         pbar.set_description("Downloading parks/green spaces")
-        parks = fetch_features(point, dist, {'leisure': 'park', 'landuse': 'grass'}, 'parks')
+        try:
+            parks = ox.features_from_point(point, tags={'leisure': 'park', 'landuse': 'grass'}, dist=dist)
+        except:
+            parks = None
         pbar.update(1)
     
-    print("✓ All data retrieved successfully!")
+    print("✓ All data downloaded successfully!")
     
     # 2. Setup Plot
     print("Rendering map...")
@@ -333,18 +253,11 @@ def create_poster(city, country, point, dist, output_file, output_format):
     ax.set_position([0, 0, 1, 1])
     
     # 3. Plot Layers
-    # Layer 1: Polygons (filter to only plot polygon/multipolygon geometries, not points)
+    # Layer 1: Polygons
     if water is not None and not water.empty:
-        # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
-        water_polys = water[water.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-        if not water_polys.empty:
-            water_polys.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=1)
-    
+        water.plot(ax=ax, facecolor=THEME['water'], edgecolor='none', zorder=1)
     if parks is not None and not parks.empty:
-        # Filter to only polygon/multipolygon geometries to avoid point features showing as dots
-        parks_polys = parks[parks.geometry.type.isin(['Polygon', 'MultiPolygon'])]
-        if not parks_polys.empty:
-            parks_polys.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=2)
+        parks.plot(ax=ax, facecolor=THEME['parks'], edgecolor='none', zorder=2)
     
     # Layer 2: Roads with hierarchy coloring
     print("Applying road hierarchy colors...")
@@ -377,25 +290,10 @@ def create_poster(city, country, point, dist, output_file, output_format):
         font_coords = FontProperties(family='monospace', size=14)
     
     spaced_city = "  ".join(list(city.upper()))
-    
-    # Dynamically adjust font size based on city name length to prevent truncation
-    base_font_size = 60
-    city_char_count = len(city)
-    if city_char_count > 10:
-        # Scale down font size for longer names
-        scale_factor = 10 / city_char_count
-        adjusted_font_size = max(base_font_size * scale_factor, 24)  # Minimum size of 24
-    else:
-        adjusted_font_size = base_font_size
-    
-    if FONTS:
-        font_main_adjusted = FontProperties(fname=FONTS['bold'], size=adjusted_font_size)
-    else:
-        font_main_adjusted = FontProperties(family='monospace', weight='bold', size=adjusted_font_size)
 
     # --- BOTTOM TEXT ---
     ax.text(0.5, 0.14, spaced_city, transform=ax.transAxes,
-            color=THEME['text'], ha='center', fontproperties=font_main_adjusted, zorder=11)
+            color=THEME['text'], ha='center', fontproperties=font_main, zorder=11)
     
     ax.text(0.5, 0.10, country.upper(), transform=ax.transAxes,
             color=THEME['text'], ha='center', fontproperties=font_sub, zorder=11)
@@ -408,8 +306,9 @@ def create_poster(city, country, point, dist, output_file, output_format):
     ax.text(0.5, 0.07, coords, transform=ax.transAxes,
             color=THEME['text'], alpha=0.7, ha='center', fontproperties=font_coords, zorder=11)
     
-    ax.plot([0.4, 0.6], [0.125, 0.125], transform=ax.transAxes, 
-            color=THEME['text'], linewidth=1, zorder=11)
+    if (city != "" and country != ""):
+        ax.plot([0.4, 0.6], [0.125, 0.125], transform=ax.transAxes, 
+        color=THEME['text'], linewidth=1, zorder=11)
 
     # --- ATTRIBUTION (bottom right) ---
     if FONTS:
@@ -417,25 +316,16 @@ def create_poster(city, country, point, dist, output_file, output_format):
     else:
         font_attr = FontProperties(family='monospace', size=8)
     
-    ax.text(0.98, 0.02, "© OpenStreetMap contributors", transform=ax.transAxes,
-            color=THEME['text'], alpha=0.5, ha='right', va='bottom', 
-            fontproperties=font_attr, zorder=11)
+    # ax.text(0.98, 0.02, "© OpenStreetMap contributors", transform=ax.transAxes,
+    #         color=THEME['text'], alpha=0.5, ha='right', va='bottom', 
+    #         fontproperties=font_attr, zorder=11)
 
     # 5. Save
     print(f"Saving to {output_file}...")
-
-    fmt = output_format.lower()
-    save_kwargs = dict(facecolor=THEME["bg"], bbox_inches="tight", pad_inches=0.05,)
-
-    # DPI matters mainly for raster formats
-    if fmt == "png":
-        save_kwargs["dpi"] = 300
-
-    plt.savefig(output_file, format=fmt, **save_kwargs)
-
+    #plt.savefig(output_file, dpi=150, facecolor=THEME['bg'])
+    plt.savefig(output_file, dpi=args.dpi, facecolor=THEME['bg'])
     plt.close()
     print(f"✓ Done! Poster saved as {output_file}")
-
 
 def print_examples():
     """Print usage examples."""
@@ -533,13 +423,14 @@ Examples:
     
     parser.add_argument('--city', '-c', type=str, help='City name')
     parser.add_argument('--country', '-C', type=str, help='Country name')
+    parser.add_argument('--latlong', '-ll', type=float, nargs=2, metavar=("Latitude", "Longitude"), help='Alternate designation for the map center by latitude and longitude')
     parser.add_argument('--theme', '-t', type=str, default='feature_based', help='Theme name (default: feature_based)')
     parser.add_argument('--distance', '-d', type=int, default=29000, help='Map radius in meters (default: 29000)')
     parser.add_argument('--list-themes', action='store_true', help='List all available themes')
-    parser.add_argument('--format', '-f', default='png', choices=['png', 'svg', 'pdf'],help='Output format for the poster (default: png)')
-    
+    parser.add_argument('--dpi', type=int, default=150, help='Output resolution')
+
     args = parser.parse_args()
-    
+
     # If no arguments provided, show examples
     if len(os.sys.argv) == 1:
         print_examples()
@@ -549,10 +440,10 @@ Examples:
     if args.list_themes:
         list_themes()
         os.sys.exit(0)
-    
+
     # Validate required arguments
-    if not args.city or not args.country:
-        print("Error: --city and --country are required.\n")
+    if not (args.city and args.country) and not args.latlong:
+        print("Error: either --city and --country or --latlong are required.\n")
         print_examples()
         os.sys.exit(1)
     
@@ -570,11 +461,14 @@ Examples:
     # Load theme
     THEME = load_theme(args.theme)
     
+    args.city = args.city if args.city else ""
+    args.country = args.country if args.country else ""
+
     # Get coordinates and generate poster
     try:
-        coords = get_coordinates(args.city, args.country)
-        output_file = generate_output_filename(args.city, args.theme, args.format)
-        create_poster(args.city, args.country, coords, args.distance, output_file, args.format)
+        coords = args.latlong if args.latlong else get_coordinates(args.city, args.country)
+        output_file = generate_output_filename(args.city, args.theme, args.distance, args.dpi)
+        create_poster(args.city, args.country, coords, args.distance, output_file)
         
         print("\n" + "=" * 50)
         print("✓ Poster generation complete!")
